@@ -17,8 +17,8 @@ use super::basic_block::{BasicBlock, SourceMapEntry};
 use super::ffi::{AbstractOperationKind, WellKnownSymbolKind};
 use super::instruction::Instruction;
 use super::operand::*;
-use crate::ast::{AstArena, FunctionData, FunctionId, FunctionTable, IdentifierId, LocalType, Position, Utf16String};
-use crate::u32_from_usize;
+use crate::ast::{AstArena, FunctionId, IdentifierId, LocalType, Position, Utf16String};
+use crate::{IncompleteSFDPtr, IncompleteSharedFunctionData, u32_from_usize};
 use std::sync::Arc;
 
 /// Identifies an operand that auto-frees its register when the last
@@ -37,15 +37,15 @@ pub(crate) struct ScopedOperandInner {
     free_register_pool: Rc<RefCell<Vec<Register>>>,
 }
 
-pub struct PendingSharedFunctionData {
-    pub function_data: Option<Box<FunctionData>>,
-    pub subtable: Option<FunctionTable>,
-    pub arena: Option<Arc<AstArena>>,
-    pub name_override: Option<Utf16String>,
-    pub class_field_initializer_name: Option<(Utf16String, bool)>,
-    pub should_eager_compile: bool,
-    pub precompiled_function: Option<Box<PrecompiledFunction>>,
-}
+// pub struct PendingSharedFunctionData {
+//     pub function_data: Option<Box<FunctionData>>,
+//     pub subtable: Option<FunctionTable>,
+//     pub arena: Option<Arc<AstArena>>,
+//     pub name_override: Option<Utf16String>,
+//     pub class_field_initializer_name: Option<(Utf16String, bool)>,
+//     pub should_eager_compile: bool,
+//     pub precompiled_function: Option<Box<PrecompiledFunction>>,
+// }
 
 /// Metadata computed from scope analysis for a SharedFunctionInstanceData.
 pub struct FunctionSfdMetadata {
@@ -292,7 +292,7 @@ pub struct Generator {
     // Pending descriptors for SharedFunctionInstanceData objects. These are
     // materialized at the C++ boundary so bytecode generation can run without
     // allocating GC cells.
-    pub shared_function_data: Vec<PendingSharedFunctionData>,
+    pub shared_function_data: Vec<IncompleteSFDPtr>,
     pub eager_compile_function_ids: HashSet<FunctionId>,
     pub eager_compile_direct_iifes: bool,
 
@@ -723,7 +723,7 @@ impl Generator {
     }
 
     /// Register a pending SharedFunctionInstanceData descriptor and return its index.
-    pub fn register_shared_function_data(&mut self, data: PendingSharedFunctionData) -> u32 {
+    pub fn register_shared_function_data(&mut self, data: IncompleteSFDPtr) -> u32 {
         let index = u32_from_usize(self.shared_function_data.len());
         self.shared_function_data.push(data);
         index
@@ -731,7 +731,16 @@ impl Generator {
 
     pub fn set_class_field_initializer_name(&mut self, index: u32, name: Utf16String, is_private: bool) {
         if let Some(data) = self.shared_function_data.get_mut(index as usize) {
-            data.class_field_initializer_name = Some((name, is_private));
+            let mut data_guard = data.lock().expect("Failed to lock IncompleteSFDPtr");
+            if let IncompleteSharedFunctionData::Bytecode {
+                class_field_initializer_name,
+                ..
+            } = &mut *data_guard
+            {
+                *class_field_initializer_name = Some((name, is_private));
+            } else {
+                panic!("Expected Compiled PendingFunctionData at index {index}");
+            }
         }
     }
 

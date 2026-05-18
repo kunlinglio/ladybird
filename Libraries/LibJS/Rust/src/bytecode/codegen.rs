@@ -39,6 +39,7 @@
 //! - **Helpers**: constant folding, NaN-boxing, error message utilities
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -46,11 +47,12 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use crate::ast::*;
 use crate::lexer::ch;
 use crate::u32_from_usize;
+use crate::{IncompleteSFDPtr, IncompleteSharedFunctionData};
 
 use super::ffi::{AbstractOperationKind, WellKnownSymbolKind};
 use super::generator::{
     BlockBoundaryType, ConstantValue, FinallyContext, Generator, PendingClassBlueprint, PendingClassElement,
-    PendingLiteralValueKind, PendingSharedFunctionData, ScopedOperand, choose_dst, constant_to_boolean, parse_bigint,
+    PendingLiteralValueKind, ScopedOperand, choose_dst, constant_to_boolean, parse_bigint,
 };
 use super::instruction::Instruction;
 use super::operand::*;
@@ -659,8 +661,28 @@ fn generate_function_expression(
     preferred_dst: Option<&ScopedOperand>,
 ) -> ScopedOperand {
     let should_eager_compile = generator.eager_compile_function_ids.contains(&function_id);
-    let data = generator.function_table.take(function_id);
-    let has_name = data.name.is_some();
+    let data_ptr = generator.function_table.take(function_id);
+    let name = {
+        let data = data_ptr
+            .lock()
+            .expect("FunctionTable::take: function data already taken by another thread");
+        match &*data {
+            IncompleteSharedFunctionData::Bytecode { function_data, .. } => {
+                let function_data = function_data
+                    .as_ref()
+                    .expect("FunctionTable::take: expected complete function data");
+                function_data.name
+            }
+            IncompleteSharedFunctionData::Ast { ast_fd: parsed_data } => parsed_data.name,
+            _ => {
+                panic!(
+                    "FunctionTable::take: expected AST or Bytecode function data, got {:?}",
+                    data.dump_type()
+                );
+            }
+        }
+    };
+    let has_name = name.is_some();
 
     // Named function expressions get an intermediate scope so the name
     // is visible inside the function body but not outside.
@@ -680,7 +702,7 @@ fn generate_function_expression(
         });
         generator.push_static_lexical_environment(new_env);
 
-        let name_id = data.name.expect("function declaration must have a name");
+        let name_id = name.expect("function declaration must have a name");
         let arena = generator.arena.clone();
         let id = generator.intern_identifier_id(arena.identifiers[name_id].name);
         generator.emit(Instruction::CreateVariable {
@@ -705,13 +727,23 @@ fn generate_function_expression(
     };
     let lhs_name_str: Option<Utf16String> = lhs_name.map(|index| generator.identifier_table[index.0 as usize].clone());
     let name_override = if !has_name { lhs_name_str.as_deref() } else { None };
-    let shared_function_data_index = emit_new_function(generator, data, name_override);
+    let shared_function_data_index = emit_new_function(generator, data_ptr, name_override);
     if should_eager_compile
         && let Some(pending) = generator
             .shared_function_data
             .get_mut(shared_function_data_index as usize)
     {
-        pending.should_eager_compile = true;
+        let mut pending_guard = pending
+            .lock()
+            .expect("SharedFunctionData should not be locked at this point");
+        let IncompleteSharedFunctionData::Bytecode {
+            should_eager_compile: ref mut function_should_eager_compile,
+            ..
+        } = *pending_guard
+        else {
+            panic!("expected bytecode function data");
+        };
+        *function_should_eager_compile = true;
     }
     let home_object = generator.home_objects.last().map(|ho| ho.operand());
     generator.emit(Instruction::NewFunction {
@@ -6358,26 +6390,28 @@ fn generate_class_expression(
                         );
 
                         // Class bodies are always strict mode.
-                        let function_data = Box::new(FunctionData {
-                            name: None,
-                            source_text_start: init_expression.range.start.offset,
-                            source_text_end: init_expression.range.end.offset,
-                            body: Box::new(body_statement),
-                            parameters: Vec::new(),
-                            function_length: 0,
-                            kind: FunctionKind::Normal,
-                            is_strict_mode: true,
-                            is_arrow_function: false,
-                            parsing_insights: FunctionParsingInsights {
-                                uses_this: true,
-                                uses_this_from_environment: true,
-                                ..Default::default()
-                            },
-                            // This wrapper is synthesized after parsing, so it
-                            // asks FunctionTable to discover nested functions
-                            // from the wrapped initializer expression.
-                            nested_function_ids: None,
-                        });
+                        let function_data = Arc::new(Mutex::new(IncompleteSharedFunctionData::Ast {
+                            ast_fd: Box::new(FunctionData {
+                                name: None,
+                                source_text_start: init_expression.range.start.offset,
+                                source_text_end: init_expression.range.end.offset,
+                                body: Box::new(body_statement),
+                                parameters: Vec::new(),
+                                function_length: 0,
+                                kind: FunctionKind::Normal,
+                                is_strict_mode: true,
+                                is_arrow_function: false,
+                                parsing_insights: FunctionParsingInsights {
+                                    uses_this: true,
+                                    uses_this_from_environment: true,
+                                    ..Default::default()
+                                },
+                                // This wrapper is synthesized after parsing, so it
+                                // asks FunctionTable to discover nested functions
+                                // from the wrapped initializer expression.
+                                nested_function_ids: None,
+                            }),
+                        }));
                         let index = emit_new_function(generator, function_data, Some(utf16!("field")));
 
                         let key_is_private = is_private_key(key);
@@ -6413,26 +6447,28 @@ fn generate_class_expression(
             ClassElement::StaticInitializer { body } => {
                 // Wrap the static block body in a function.
                 // Class bodies are always strict mode.
-                let function_data = Box::new(FunctionData {
-                    name: None,
-                    source_text_start: body.range.start.offset,
-                    source_text_end: body.range.end.offset,
-                    body: body.clone(),
-                    parameters: Vec::new(),
-                    function_length: 0,
-                    kind: FunctionKind::Normal,
-                    is_strict_mode: true,
-                    is_arrow_function: false,
-                    parsing_insights: FunctionParsingInsights {
-                        uses_this: true,
-                        uses_this_from_environment: true,
-                        ..Default::default()
-                    },
-                    // Static initializer wrappers are synthesized after parsing;
-                    // keep the structural fallback for nested functions inside
-                    // the wrapped block.
-                    nested_function_ids: None,
-                });
+                let function_data = Arc::new(Mutex::new(IncompleteSharedFunctionData::Ast {
+                    ast_fd: Box::new(FunctionData {
+                        name: None,
+                        source_text_start: body.range.start.offset,
+                        source_text_end: body.range.end.offset,
+                        body: body.clone(),
+                        parameters: Vec::new(),
+                        function_length: 0,
+                        kind: FunctionKind::Normal,
+                        is_strict_mode: true,
+                        is_arrow_function: false,
+                        parsing_insights: FunctionParsingInsights {
+                            uses_this: true,
+                            uses_this_from_environment: true,
+                            ..Default::default()
+                        },
+                        // Static initializer wrappers are synthesized after parsing;
+                        // keep the structural fallback for nested functions inside
+                        // the wrapped block.
+                        nested_function_ids: None,
+                    }),
+                }));
                 let sfd_index = Some(emit_new_function(generator, function_data, None));
 
                 class_elements.push(PendingClassElement {
@@ -6538,26 +6574,32 @@ fn emit_default_constructor(generator: &mut Generator, has_super: bool) -> u32 {
     };
 
     let function_id = function_id.expect("default constructor: no FunctionDeclaration found");
-    let mut function_data = parser.function_table.take(function_id);
+    let function_data_ptr = parser.function_table.take(function_id);
+    let mut function_data_guard = function_data_ptr
+        .lock()
+        .expect("default constructor: failed to lock FunctionData");
+    let mut function_data = std::mem::replace(&mut *function_data_guard, IncompleteSharedFunctionData::Materialized); // as a placeholder
+    let IncompleteSharedFunctionData::Ast { ref mut ast_fd } = function_data else {
+        panic!("default constructor: expected AST-based FunctionData");
+    };
 
     // Zero out source text range since this is synthetic source,
     // not part of the original source code buffer.
-    function_data.source_text_start = 0;
-    function_data.source_text_end = 0;
+    ast_fd.source_text_start = 0;
+    ast_fd.source_text_end = 0;
 
-    let subtable = parser
-        .function_table
-        .extract_reachable(&function_data, &parser.arena.scopes);
+    let subtable = parser.function_table.extract_reachable(ast_fd, &parser.arena.scopes);
     let arena = std::sync::Arc::new(std::mem::take(&mut parser.arena));
-    generator.register_shared_function_data(PendingSharedFunctionData {
-        function_data: Some(function_data),
+    *function_data_guard = IncompleteSharedFunctionData::Bytecode {
+        function_data: Some(ast_fd.clone()),
         subtable: Some(subtable),
         arena: Some(arena),
         name_override: None,
         class_field_initializer_name: None,
         should_eager_compile: false,
         precompiled_function: None,
-    })
+    };
+    generator.register_shared_function_data(function_data_ptr.clone())
 }
 
 /// Check if a key expression is a private identifier, return (is_private, private_name).
@@ -8382,26 +8424,47 @@ fn generate_try_statement(
 /// and register it with the generator.
 ///
 /// Returns the shared_function_data_index for use in NewFunction instructions.
-fn emit_new_function(generator: &mut Generator, data: Box<FunctionData>, name_override: Option<&[u16]>) -> u32 {
+fn emit_new_function(generator: &mut Generator, data: IncompleteSFDPtr, name_override: Option<&[u16]>) -> u32 {
+    let mut data_guard = data.lock().expect("Function data mutex was poisoned");
+    let function_data = std::mem::replace(&mut *data_guard, IncompleteSharedFunctionData::Materialized); // as a placeholder
+    let function_data = match function_data {
+        IncompleteSharedFunctionData::Ast { ast_fd } => ast_fd,
+
+        IncompleteSharedFunctionData::Bytecode { function_data, .. } => {
+            let Some(function_data) = function_data else {
+                panic!("emit_new_function called with incomplete function data");
+            };
+            function_data
+        }
+        _ => {
+            panic!("emit_new_function called with already materialized function data");
+        }
+    };
     assert!(
-        data.source_text_end as usize <= generator.source_len,
+        function_data.source_text_end as usize <= generator.source_len,
         "Function source range out of bounds: {}..{} (source len {})",
-        data.source_text_start,
-        data.source_text_end,
+        function_data.source_text_start,
+        function_data.source_text_end,
         generator.source_len
     );
 
     let arena_clone = generator.arena.clone();
-    let subtable = generator.function_table.extract_reachable(&data, &arena_clone.scopes);
-    generator.register_shared_function_data(PendingSharedFunctionData {
-        function_data: Some(data),
-        subtable: Some(subtable),
-        arena: None,
-        name_override: name_override.map(Utf16String::from),
-        class_field_initializer_name: None,
-        should_eager_compile: false,
-        precompiled_function: None,
-    })
+    let subtable = generator
+        .function_table
+        .extract_reachable(&function_data, &arena_clone.scopes);
+    let _ = std::mem::replace(
+        &mut *data_guard,
+        IncompleteSharedFunctionData::Bytecode {
+            function_data: Some(function_data),
+            subtable: Some(subtable),
+            arena: None,
+            name_override: name_override.map(Utf16String::from),
+            class_field_initializer_name: None,
+            should_eager_compile: false,
+            precompiled_function: None,
+        },
+    );
+    generator.register_shared_function_data(data.clone())
 }
 
 // =============================================================================

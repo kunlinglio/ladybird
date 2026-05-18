@@ -7,9 +7,8 @@
 //! Expression parsing: primary, secondary (binary/postfix), unary, and
 //! precedence climbing.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::ast::*;
 use crate::lexer::ch;
 use crate::parser::{
     Associativity, ForbiddenTokens, FunctionKind, MethodKind, PRECEDENCE_ASSIGNMENT, PRECEDENCE_COMMA,
@@ -17,6 +16,7 @@ use crate::parser::{
     is_strict_reserved_word,
 };
 use crate::token::{Token, TokenType};
+use crate::{IncompleteSharedFunctionData, ast::*};
 
 #[derive(PartialEq, Eq)]
 enum EscapeMode {
@@ -716,13 +716,17 @@ impl Parser<'_> {
                 let is_private_in = matches!(&lhs.inner, ExpressionKind::PrivateIdentifier(_));
                 self.consume();
                 let rhs = self.parse_expression(min_precedence, Self::operator_associativity(tt), forbidden);
-                if is_private_in
-                    && let ExpressionKind::Function(fn_id) = &rhs.inner
-                    && self.function_table.get(*fn_id).is_arrow_function
-                {
-                    self.syntax_error(
-                        "Arrow function is not allowed as the right-hand side of a private 'in' expression",
-                    );
+                if is_private_in && let ExpressionKind::Function(fn_id) = &rhs.inner {
+                    let function_data_ptr = self.function_table.get(*fn_id);
+                    let lock_guard = function_data_ptr.lock().expect("IncompleteSFDPtr lock failed");
+                    let IncompleteSharedFunctionData::Ast { ast_fd } = &*lock_guard else {
+                        panic!("Expected function data to be AST");
+                    };
+                    if ast_fd.is_arrow_function {
+                        self.syntax_error(
+                            "Arrow function is not allowed as the right-hand side of a private 'in' expression",
+                        );
+                    }
                 }
 
                 (
@@ -2389,19 +2393,21 @@ impl Parser<'_> {
             self.flags.in_class_static_init_block = saved_static_init;
             self.flags.in_formal_parameter_context = saved_formal_parameter_ctx;
             let nested_function_ids = self.pop_function_context();
-            let function_id = self.insert_function_data(FunctionData {
-                name: None,
-                source_text_start: src_start,
-                source_text_end: self.source_text_end_offset(),
-                body: Box::new(body),
-                parameters,
-                function_length,
-                kind: fn_kind,
-                is_strict_mode: self.flags.strict_mode || has_use_strict,
-                is_arrow_function: true,
-                parsing_insights: insights,
-                nested_function_ids: Some(nested_function_ids),
-            });
+            let function_id = self.insert_function_data(Arc::new(Mutex::new(IncompleteSharedFunctionData::Ast {
+                ast_fd: Box::new(FunctionData {
+                    name: None,
+                    source_text_start: src_start,
+                    source_text_end: self.source_text_end_offset(),
+                    body: Box::new(body),
+                    parameters,
+                    function_length,
+                    kind: fn_kind,
+                    is_strict_mode: self.flags.strict_mode || has_use_strict,
+                    is_arrow_function: true,
+                    parsing_insights: insights,
+                    nested_function_ids: Some(nested_function_ids),
+                }),
+            })));
             Some(self.expression(start, ExpressionKind::Function(function_id)))
         } else {
             let body_forbidden = if saved_formal_parameter_ctx {
@@ -2447,19 +2453,21 @@ impl Parser<'_> {
             self.flags.in_class_static_init_block = saved_static_init;
             self.flags.in_formal_parameter_context = saved_formal_parameter_ctx;
             let nested_function_ids = self.pop_function_context();
-            let function_id = self.insert_function_data(FunctionData {
-                name: None,
-                source_text_start: src_start,
-                source_text_end: self.source_text_end_offset(),
-                body: Box::new(body),
-                parameters,
-                function_length,
-                kind: fn_kind,
-                is_strict_mode: self.flags.strict_mode,
-                is_arrow_function: true,
-                parsing_insights: insights,
-                nested_function_ids: Some(nested_function_ids),
-            });
+            let function_id = self.insert_function_data(Arc::new(Mutex::new(IncompleteSharedFunctionData::Ast {
+                ast_fd: Box::new(FunctionData {
+                    name: None,
+                    source_text_start: src_start,
+                    source_text_end: self.source_text_end_offset(),
+                    body: Box::new(body),
+                    parameters,
+                    function_length,
+                    kind: fn_kind,
+                    is_strict_mode: self.flags.strict_mode,
+                    is_arrow_function: true,
+                    parsing_insights: insights,
+                    nested_function_ids: Some(nested_function_ids),
+                }),
+            })));
             Some(self.expression(start, ExpressionKind::Function(function_id)))
         }
     }
@@ -2552,19 +2560,21 @@ impl Parser<'_> {
         }
 
         let nested_function_ids = self.pop_function_context();
-        let function_id = self.insert_function_data(FunctionData {
-            name: None,
-            source_text_start: function_start.offset,
-            source_text_end: self.source_text_end_offset(),
-            body: Box::new(body),
-            parameters: parsed.parameters,
-            function_length: parsed.function_length,
-            kind: fn_kind,
-            is_strict_mode: self.flags.strict_mode || has_use_strict,
-            is_arrow_function: false,
-            parsing_insights: insights,
-            nested_function_ids: Some(nested_function_ids),
-        });
+        let function_id = self.insert_function_data(Arc::new(Mutex::new(IncompleteSharedFunctionData::Ast {
+            ast_fd: Box::new(FunctionData {
+                name: None,
+                source_text_start: function_start.offset,
+                source_text_end: self.source_text_end_offset(),
+                body: Box::new(body),
+                parameters: parsed.parameters,
+                function_length: parsed.function_length,
+                kind: fn_kind,
+                is_strict_mode: self.flags.strict_mode || has_use_strict,
+                is_arrow_function: false,
+                parsing_insights: insights,
+                nested_function_ids: Some(nested_function_ids),
+            }),
+        })));
         self.expression(start, ExpressionKind::Function(function_id))
     }
 }

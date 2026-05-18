@@ -9,6 +9,7 @@
 //! Produces tree-drawing output to stdout via `println!`, matching
 //! the C++ `outln` calls.
 
+use crate::IncompleteSharedFunctionData;
 use crate::ast::*;
 use std::cell::RefCell;
 use std::fmt::Write;
@@ -550,8 +551,14 @@ fn dump_statement(statement: &Statement, state: &DumpState) {
         }
 
         StatementKind::FunctionDeclaration(data) => {
-            let function_data = state.function_table().get(data.function_id);
-            dump_function(function_data, "FunctionDeclaration", &statement.range, state);
+            let function_data_ptr = state.function_table().get(data.function_id);
+            let function_data = function_data_ptr
+                .lock()
+                .expect("FunctionTable::get: function data already taken by another thread");
+            let IncompleteSharedFunctionData::Ast { ast_fd } = &*function_data else {
+                panic!("FunctionTable::get: expected parsed function data");
+            };
+            dump_function(ast_fd, "FunctionDeclaration", &statement.range, state);
         }
 
         StatementKind::ClassDeclaration(class_data) => {
@@ -878,8 +885,14 @@ fn dump_expression(expression: &Expression, state: &DumpState) {
         }
 
         ExpressionKind::Function(function_id) => {
-            let function_data = state.function_table().get(*function_id);
-            dump_function(function_data, "FunctionExpression", &expression.range, state);
+            let function_data_ptr = state.function_table().get(*function_id);
+            let function_data = function_data_ptr
+                .lock()
+                .expect("FunctionTable::get: function data already taken by another thread");
+            let IncompleteSharedFunctionData::Ast { ast_fd } = &*function_data else {
+                panic!("FunctionTable::get: expected parsed function data");
+            };
+            dump_function(ast_fd, "FunctionExpression", &expression.range, state);
         }
 
         ExpressionKind::Class(class_data) => {
