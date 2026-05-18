@@ -29,7 +29,7 @@ use super::generator::{
 };
 use crate::ast::Utf16String;
 use crate::bytecode::basic_block::SourceMapEntry;
-use crate::u32_from_usize;
+use crate::{IncompleteSharedFunctionData, u32_from_usize};
 
 /// Opaque pointer returned from rust_create_executable.
 pub type ExecutableHandle = *mut c_void;
@@ -445,29 +445,41 @@ unsafe fn materialize_shared_function_data(
 ) -> Vec<*const c_void> {
     unsafe {
         let mut sfd_ptrs = Vec::with_capacity(generator.shared_function_data.len());
-        for pending in &mut generator.shared_function_data {
-            let function_data = pending
-                .function_data
+        for pending_ptr in &mut generator.shared_function_data {
+            let mut pending_guard = pending_ptr.lock().expect("function data mutex was poisoned");
+            let pending = std::mem::replace(&mut *pending_guard, crate::IncompleteSharedFunctionData::Materialized);
+            let IncompleteSharedFunctionData::Bytecode {
+                mut function_data,
+                mut subtable,
+                arena,
+                name_override,
+                class_field_initializer_name,
+                mut precompiled_function,
+                ..
+            } = pending
+            else {
+                panic!("shared function data was already materialized");
+            };
+            let function_data = function_data
                 .take()
                 .expect("pending shared function data was already materialized");
-            let subtable = pending
-                .subtable
+            let subtable = subtable
                 .take()
                 .expect("pending shared function data subtable was already materialized");
-            let arena = pending.arena.clone().unwrap_or_else(|| generator.arena.clone());
+            let arena = arena.clone().unwrap_or_else(|| generator.arena.clone());
             let sfd_ptr = create_shared_function_data(
                 function_data,
                 subtable,
                 vm_ptr,
                 source_code_ptr,
                 generator.strict,
-                pending.name_override.as_ref().map(|name| name.as_slice()),
+                name_override.as_ref().map(|name| name.as_slice()),
                 arena,
             );
-            if let Some((name, is_private)) = &pending.class_field_initializer_name {
+            if let Some((name, is_private)) = &class_field_initializer_name {
                 rust_sfd_set_class_field_initializer_name(sfd_ptr, name.as_ptr(), name.len(), *is_private);
             }
-            if let Some(precompiled) = pending.precompiled_function.take() {
+            if let Some(precompiled) = precompiled_function.take() {
                 let uses_this = precompiled.metadata.uses_this;
                 let this_value_needs_environment_resolution =
                     precompiled.metadata.this_value_needs_environment_resolution;

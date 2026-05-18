@@ -21,14 +21,16 @@ use crate::bytecode::ffi::{
 };
 use crate::bytecode::generator::{
     AssembledBytecode, ConstantValue, ExceptionHandler, FunctionSfdMetadata, Generator, LocalVariable,
-    PendingClassBlueprint, PendingClassElement, PendingLiteralValueKind, PendingSharedFunctionData,
-    PrecompiledFunction,
+    PendingClassBlueprint, PendingClassElement, PendingLiteralValueKind, PrecompiledFunction,
 };
 use crate::bytecode::operand::PropertyKeyTableIndex;
 use crate::bytecode::validator::{
     FFIExceptionHandlerOffsets, FFIValidatorBounds, ValidationErrorKind, validate_bytecode,
 };
-use crate::{CompiledProgram, CompiledProgramBytecode, ModuleCallbacks, ast, u32_from_usize};
+use crate::{
+    CompiledProgram, CompiledProgramBytecode, IncompleteSFDPtr, IncompleteSharedFunctionData, ModuleCallbacks, ast,
+    u32_from_usize,
+};
 
 const MAGIC: &[u8; 8] = b"LBJSBC\0\0";
 const FORMAT_VERSION: u32 = 8;
@@ -2824,9 +2826,10 @@ struct SharedFunctionTable<'a>(&'a Generator);
 
 impl Encode for SharedFunctionTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        DecodedRecordSequence::encode(encoder, &self.0.shared_function_data, |shared_data, encoder| {
+        DecodedRecordSequence::encode(encoder, &self.0.shared_function_data, |shared_data_ptr, encoder| {
+            let shared_data_guard = shared_data_ptr.lock().unwrap();
             FunctionRecord {
-                shared_data,
+                shared_data: &shared_data_guard,
                 arena: &self.0.arena,
             }
             .encode(encoder);
@@ -2890,16 +2893,23 @@ impl DecodedFunctionTable {
     }
 }
 
-struct DeclarationFunctionTable<'a>(&'a [PendingSharedFunctionData]);
+struct DeclarationFunctionTable<'a>(&'a [IncompleteSFDPtr]);
 
 impl Encode for DeclarationFunctionTable<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        encoder.sequence(self.0, |shared_data, encoder| {
-            let arena = shared_data
-                .arena
+        encoder.sequence(self.0, |shared_data_ptr, encoder| {
+            let shared_data_guard = shared_data_ptr.lock().unwrap();
+            let IncompleteSharedFunctionData::Bytecode { arena, .. } = &*shared_data_guard else {
+                panic!("declaration function table can only contain bytecode functions");
+            };
+            let arena = arena
                 .as_deref()
                 .expect("bytecode cache declaration function is missing its AST arena");
-            FunctionRecord { shared_data, arena }.encode(encoder);
+            FunctionRecord {
+                shared_data: &shared_data_guard,
+                arena,
+            }
+            .encode(encoder);
         });
     }
 }
@@ -2911,20 +2921,24 @@ impl DeclarationFunctionTable<'_> {
 }
 
 struct FunctionRecord<'a> {
-    shared_data: &'a PendingSharedFunctionData,
+    shared_data: &'a IncompleteSharedFunctionData,
     arena: &'a ast::AstArena,
 }
 
 impl Encode for FunctionRecord<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        let function_data = self
-            .shared_data
-            .function_data
+        let IncompleteSharedFunctionData::Bytecode {
+            function_data,
+            precompiled_function,
+            ..
+        } = self.shared_data
+        else {
+            panic!("function record can only be created from bytecode function data");
+        };
+        let function_data = function_data
             .as_ref()
             .expect("bytecode cache requires function data to be retained until serialization");
-        let precompiled = self
-            .shared_data
-            .precompiled_function
+        let precompiled = precompiled_function
             .as_ref()
             .expect("fully compiled bytecode cache entry is missing nested function bytecode");
 
@@ -3013,15 +3027,20 @@ impl DecodedFunctionRecord {
 
 impl<'a> FunctionRecord<'a> {
     fn function_name(&self, function_data: &'a ast::FunctionData) -> Option<Utf16<'a>> {
-        self.shared_data
-            .name_override
+        let IncompleteSharedFunctionData::Bytecode { name_override, .. } = self.shared_data else {
+            panic!("function record can only be created from bytecode function data");
+        };
+        name_override
             .as_deref()
             .or_else(|| function_data.name.map(|name| self.function_arena().name_slice(name)))
             .map(Utf16)
     }
 
     fn function_arena(&self) -> &'a ast::AstArena {
-        self.shared_data.arena.as_deref().unwrap_or(self.arena)
+        let IncompleteSharedFunctionData::Bytecode { arena, .. } = self.shared_data else {
+            panic!("function record can only be created from bytecode function data");
+        };
+        arena.as_deref().unwrap_or(self.arena)
     }
 }
 
@@ -3067,12 +3086,18 @@ fn simple_parameter_names<'a>(
     Some(names)
 }
 
-struct ClassFieldInitializerName<'a>(&'a PendingSharedFunctionData);
+struct ClassFieldInitializerName<'a>(&'a IncompleteSharedFunctionData);
 
 impl Encode for ClassFieldInitializerName<'_> {
     fn encode(&self, encoder: &mut Encoder) {
-        self.0
-            .class_field_initializer_name
+        let IncompleteSharedFunctionData::Bytecode {
+            class_field_initializer_name,
+            ..
+        } = self.0
+        else {
+            panic!("class field initializer name can only be encoded for bytecode function data");
+        };
+        class_field_initializer_name
             .as_ref()
             .map(|(name, is_private)| (Utf16(name.as_slice()), *is_private))
             .encode(encoder);

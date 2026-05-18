@@ -35,9 +35,9 @@
 use crate::fast_hash::{HashMap, HashSet};
 
 use crate::ast::{
-    AstArena, BindingPattern, Expression, ExpressionKind, FunctionData, FunctionId, FunctionParameter, FunctionTable,
-    Identifier, IdentifierId, PrivateIdentifier, ProgramData, ScopeData, ScopeId, SourceRange, Statement,
-    StatementKind, StringId, Utf16String,
+    AstArena, BindingPattern, Expression, ExpressionKind, FunctionId, FunctionParameter, FunctionTable, Identifier,
+    IdentifierId, PrivateIdentifier, ProgramData, ScopeData, ScopeId, SourceRange, Statement, StatementKind, StringId,
+    Utf16String,
 };
 use crate::lexer::{Lexer, ch};
 use crate::scope_collector::{ScopeCollector, ScopeCollectorState};
@@ -375,7 +375,10 @@ impl<'a> Parser<'a> {
             .expect("Parser::pop_function_context: no active function context")
     }
 
-    pub(crate) fn insert_function_data(&mut self, data: FunctionData) -> FunctionId {
+    pub(crate) fn insert_function_data(
+        &mut self,
+        data: std::sync::Arc<std::sync::Mutex<crate::IncompleteSharedFunctionData>>,
+    ) -> FunctionId {
         let function_id = self.function_table.insert(data);
         if let Some(context) = self.function_context_stack.last_mut() {
             // The newly parsed function belongs to the innermost function

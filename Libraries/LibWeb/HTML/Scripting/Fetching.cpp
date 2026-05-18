@@ -1149,7 +1149,7 @@ void fetch_single_module_script(JS::Realm& realm,
                             auto source_code_for_cache = source_code;
                             auto module_script = result.compiled
                                 ? ModuleScript::create_from_pre_compiled(url_string, move(source_code), *settings_root, move(response_url), result.compiled).release_value_but_fixme_should_propagate_errors()
-                                : ModuleScript::create_from_pre_parsed(url_string, move(source_code), *settings_root, move(response_url), result.parsed).release_value_but_fixme_should_propagate_errors();
+                                : ModuleScript::create_from_pre_parsed(url_string, move(source_code), *settings_root, move(response_url), result.parsed).release_value_but_fixme_should_propagate_errors(); // FIXME: Currently we parsed same modules twice just for accurate errors.
                             if (module_script)
                                 compile_remaining_module_functions_off_thread(*module_script, move(source_code_for_background_compile));
                             settings_root->module_map().set(url, module_type_string, { ModuleMap::EntryType::ModuleScript, module_script });

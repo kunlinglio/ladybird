@@ -6,15 +6,17 @@
 
 //! Declaration parsing: variables, functions, classes, imports, exports.
 
+use std::sync::{Arc, Mutex};
+
 use crate::fast_hash::{HashMap, HashSet};
 
-use crate::ast::*;
 use crate::lexer::ch;
 use crate::parser::{
     Associativity, DeclarationKind, ForbiddenTokens, FunctionKind, MethodKind, PRECEDENCE_ASSIGNMENT, ParamInfo,
     ParsedParameters, Parser, Position, ProgramType, PropertyKey,
 };
 use crate::token::TokenType;
+use crate::{IncompleteSharedFunctionData, ast::*};
 
 fn expression_into_identifier(expression: Expression) -> IdentifierId {
     match expression.inner {
@@ -460,7 +462,9 @@ impl Parser<'_> {
         );
         let decl_name = fd.name;
         let decl_kind = fd.kind;
-        let function_id = self.insert_function_data(fd);
+        let function_id = self.insert_function_data(Arc::new(Mutex::new(crate::IncompleteSharedFunctionData::Ast {
+            ast_fd: Box::new(fd),
+        })));
         self.statement(
             start,
             StatementKind::FunctionDeclaration(Box::new(FunctionDeclarationData {
@@ -530,7 +534,9 @@ impl Parser<'_> {
             start,
             saved_might_need_arguments,
         );
-        let function_id = self.insert_function_data(fd);
+        let function_id = self.insert_function_data(Arc::new(Mutex::new(crate::IncompleteSharedFunctionData::Ast {
+            ast_fd: Box::new(fd),
+        })));
         self.expression(start, ExpressionKind::Function(function_id))
     }
 
@@ -827,45 +833,49 @@ impl Parser<'_> {
                 is_rest: true,
             }];
 
-            let function_id = self.insert_function_data(FunctionData {
-                name: ctor_name,
-                source_text_start: start.offset,
-                source_text_end: self.source_text_end_offset(),
-                body: Box::new(body),
-                parameters,
-                function_length: 0,
-                kind: FunctionKind::Normal,
-                is_strict_mode: true,
-                is_arrow_function: false,
-                parsing_insights: FunctionParsingInsights {
-                    uses_this: true,
-                    uses_this_from_environment: true,
-                    ..FunctionParsingInsights::default()
-                },
-                nested_function_ids: Some(Vec::new()),
-            });
+            let function_id = self.insert_function_data(Arc::new(Mutex::new(IncompleteSharedFunctionData::Ast {
+                ast_fd: Box::new(FunctionData {
+                    name: ctor_name,
+                    source_text_start: start.offset,
+                    source_text_end: self.source_text_end_offset(),
+                    body: Box::new(body),
+                    parameters,
+                    function_length: 0,
+                    kind: FunctionKind::Normal,
+                    is_strict_mode: true,
+                    is_arrow_function: false,
+                    parsing_insights: FunctionParsingInsights {
+                        uses_this: true,
+                        uses_this_from_environment: true,
+                        ..FunctionParsingInsights::default()
+                    },
+                    nested_function_ids: Some(Vec::new()),
+                }),
+            })));
             self.expression(start, ExpressionKind::Function(function_id))
         } else {
             let body_scope = self.make_scope(Vec::new());
             let body = self.statement(start, StatementKind::Block(body_scope));
 
-            let function_id = self.insert_function_data(FunctionData {
-                name: ctor_name,
-                source_text_start: start.offset,
-                source_text_end: self.source_text_end_offset(),
-                body: Box::new(body),
-                parameters: Vec::new(),
-                function_length: 0,
-                kind: FunctionKind::Normal,
-                is_strict_mode: true,
-                is_arrow_function: false,
-                parsing_insights: FunctionParsingInsights {
-                    uses_this: true,
-                    uses_this_from_environment: true,
-                    ..FunctionParsingInsights::default()
-                },
-                nested_function_ids: Some(Vec::new()),
-            });
+            let function_id = self.insert_function_data(Arc::new(Mutex::new(IncompleteSharedFunctionData::Ast {
+                ast_fd: Box::new(FunctionData {
+                    name: ctor_name,
+                    source_text_start: start.offset,
+                    source_text_end: self.source_text_end_offset(),
+                    body: Box::new(body),
+                    parameters: Vec::new(),
+                    function_length: 0,
+                    kind: FunctionKind::Normal,
+                    is_strict_mode: true,
+                    is_arrow_function: false,
+                    parsing_insights: FunctionParsingInsights {
+                        uses_this: true,
+                        uses_this_from_environment: true,
+                        ..FunctionParsingInsights::default()
+                    },
+                    nested_function_ids: Some(Vec::new()),
+                }),
+            })));
             self.expression(start, ExpressionKind::Function(function_id))
         }
     }

@@ -50,7 +50,9 @@ class JS_API SharedFunctionInstanceData final : public GC::Cell {
 
 public:
     static constexpr u64 asm_call_metadata_can_inline_call = 1ull << 32;
-    static constexpr u64 asm_call_metadata_needs_environment_or_this_value_resolution = 1ull << 33;
+    static constexpr u64
+        asm_call_metadata_needs_environment_or_this_value_resolution
+        = 1ull << 33;
     static constexpr u64 asm_call_metadata_uses_this = 1ull << 34;
     static constexpr u64 asm_call_metadata_strict = 1ull << 35;
 
@@ -58,13 +60,8 @@ public:
     virtual void finalize() override;
 
     SharedFunctionInstanceData(
-        VM& vm,
-        FunctionKind,
-        Utf16FlyString name,
-        i32 function_length,
-        u32 formal_parameter_count,
-        bool strict,
-        bool is_arrow_function,
+        VM& vm, FunctionKind, Utf16FlyString name, i32 function_length,
+        u32 formal_parameter_count, bool strict, bool is_arrow_function,
         bool has_simple_parameter_list,
         Vector<Utf16FlyString> parameter_names_for_mapped_arguments,
         void* rust_function_ast);
@@ -150,9 +147,19 @@ public:
     mutable GC::Ptr<EnvironmentShape> m_function_environment_shape;
     mutable GC::Ptr<EnvironmentShape> m_var_environment_shape;
 
-    Variant<PropertyKey, PrivateName, Empty> m_class_field_initializer_name; // [[ClassFieldInitializerName]]
-    ConstructorKind m_constructor_kind : 1 { ConstructorKind::Base };        // [[ConstructorKind]]
-    bool m_is_class_constructor : 1 { false };                               // [[IsClassConstructor]]
+    Variant<PropertyKey, PrivateName, Empty>
+        m_class_field_initializer_name; // [[ClassFieldInitializerName]]
+    ConstructorKind m_constructor_kind
+        : 1 { ConstructorKind::Base };         // [[ConstructorKind]]
+    bool m_is_class_constructor : 1 { false }; // [[IsClassConstructor]]
+
+    // // Note: Pointer to Rust Arc<Mutex<PendingFunctionData>>,
+    // //       used for unified function lazy parsing, compilation and
+    // //       materialization.
+    // // If match!(m_pending_payload, PendingFunctionData::Materialized),
+    // // then m_executable != nullptr, so there is no need to apply FFI calls on
+    // // each JS function call.
+    // void* m_pending_payload { nullptr };
 
     // NB: When non-null, points to a Rust Box<FunctionData> used for
     //     lazy compilation through the Rust pipeline.
@@ -164,7 +171,6 @@ public:
     //     lazy materialization from freshly compiled bytecode.
     void* m_precompiled_bytecode_executable { nullptr };
     bool m_use_rust_compilation { false };
-
     void clear_compile_inputs();
 
 private:
@@ -175,4 +181,4 @@ private:
     bool m_can_inline_call { false };
 };
 
-}
+} // namespace JS

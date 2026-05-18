@@ -96,12 +96,13 @@ pub(crate) fn u32_from_usize(value: usize) -> u32 {
     u32::try_from(value).expect("value exceeds u32::MAX")
 }
 
-use ast::StatementKind;
-use bytecode::generator::PendingSharedFunctionData;
+use ast::{AstArena, FunctionTable, Position, StatementKind, Utf16String};
+use bytecode::generator::PrecompiledFunction;
 use parser::{ParseError, Parser, ProgramType};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex};
 
 // Compile-time assertion: `ParsedProgram` travels between the parse worker
 // thread and the main thread, so it must be `Send`. After the StringId and
@@ -112,6 +113,8 @@ const _: fn() = || {
     assert_send::<ParsedProgram>();
 };
 
+unsafe impl Send for bytecode::generator::PrecompiledFunction {}
+
 // =============================================================================
 // ParsedProgram: GC-free parse result for off-thread parsing
 // =============================================================================
@@ -121,7 +124,7 @@ const _: fn() = || {
 pub struct ParsedProgram {
     program: ast::Statement,
     function_table: ast::FunctionTable,
-    arena: std::sync::Arc<ast::AstArena>,
+    arena: Arc<ast::AstArena>,
     scope_ref: ast::ScopeId,
     program_type: ast::ProgramType,
     is_strict_mode: bool,
@@ -133,7 +136,56 @@ pub struct ParsedProgram {
 pub struct CompiledProgram {
     parsed: ParsedProgram,
     bytecode: CompiledProgramBytecode,
-    declaration_functions: Vec<PendingSharedFunctionData>,
+    declaration_functions: Vec<IncompleteSFDPtr>,
+}
+
+pub type IncompleteSFDPtr = Arc<Mutex<IncompleteSharedFunctionData>>;
+
+/// An unified representation of all lazy* function data.
+/// For cold JS source (without cache), the life cycle is Text -> Ast -> Bytecode -> Materialized.
+/// For hot JS source (with cache), the life cycle is InvalidatedBytecode -> Bytecode -> Materialized.
+pub enum IncompleteSharedFunctionData {
+    Text {
+        start: Position,
+        end: Position,
+    }, // FIXME: Support lazy parsing.
+    Ast {
+        ast_fd: Box<ast::FunctionData>,
+    },
+    /// Bytecode from cache, has not yet been validated.
+    InvalidatedBytecode,
+    Bytecode {
+        function_data: Option<Box<ast::FunctionData>>,
+        subtable: Option<FunctionTable>,
+        arena: Option<Arc<AstArena>>,
+        name_override: Option<Utf16String>,
+        class_field_initializer_name: Option<(Utf16String, bool)>,
+        should_eager_compile: bool,
+        precompiled_function: Option<Box<PrecompiledFunction>>,
+    },
+    /// The Compiled -> Materialized step can only handled in the Main Thread in C++ code
+    /// So the state (e.g. executable is stored inside the SFD).
+    Materialized,
+}
+
+impl IncompleteSharedFunctionData {
+    fn has_finish_compile(&self) -> bool {
+        matches!(
+            self,
+            IncompleteSharedFunctionData::InvalidatedBytecode
+                | IncompleteSharedFunctionData::Bytecode { .. }
+                | IncompleteSharedFunctionData::Materialized
+        )
+    }
+    fn dump_type(&self) -> &'static str {
+        match self {
+            IncompleteSharedFunctionData::Text { .. } => "Text",
+            IncompleteSharedFunctionData::Ast { .. } => "Ast",
+            IncompleteSharedFunctionData::InvalidatedBytecode => "InvalidatedBytecode",
+            IncompleteSharedFunctionData::Bytecode { .. } => "Bytecode",
+            IncompleteSharedFunctionData::Materialized => "Materialized",
+        }
+    }
 }
 
 pub struct CompiledFunction {
@@ -352,28 +404,38 @@ enum FunctionPrecompileMode {
 
 fn precompile_functions(generator: &mut bytecode::generator::Generator, mode: FunctionPrecompileMode) {
     for pending in &mut generator.shared_function_data {
-        if pending.precompiled_function.is_some() {
+        let mut pending_guard = pending.lock().expect("function data mutex was poisoned");
+        let IncompleteSharedFunctionData::Bytecode {
+            precompiled_function,
+            should_eager_compile,
+            function_data,
+            subtable,
+            arena,
+            ..
+        } = &mut *pending_guard
+        else {
+            continue;
+        };
+        if precompiled_function.is_some() {
             continue;
         }
-        if matches!(mode, FunctionPrecompileMode::EagerOnly) && !pending.should_eager_compile {
+        if matches!(mode, FunctionPrecompileMode::EagerOnly) && !*should_eager_compile {
             continue;
         }
 
-        let function_data = pending
-            .function_data
+        let function_data_unwrap = function_data
             .take()
             .expect("pending eager function data was already materialized");
-        let subtable = pending
-            .subtable
+        let subtable_unwrap = subtable
             .take()
             .expect("pending eager function subtable was already materialized");
-        let arena = pending.arena.clone().unwrap_or_else(|| generator.arena.clone());
+        let arena = arena.clone().unwrap_or_else(|| generator.arena.clone());
         let payload = ast::FunctionPayload {
-            data: *function_data,
-            function_table: subtable,
+            data: *function_data_unwrap,
+            function_table: subtable_unwrap,
             arena: arena.clone(),
         };
-        let (function_data, precompiled) = compile_function_payload_to_bytecode(
+        let (compiled_function_data, precompiled) = compile_function_payload_to_bytecode(
             payload,
             generator.source_len,
             generator.builtin_abstract_operations_enabled,
@@ -381,12 +443,12 @@ fn precompile_functions(generator: &mut bytecode::generator::Generator, mode: Fu
             mode,
         );
 
-        pending.function_data = Some(function_data);
+        *function_data = Some(compiled_function_data);
         // The precompiled executable owns any nested lazy function payloads. Keep
         // an empty payload here only until materialization creates the SFD; it is
         // immediately cleared after the precompiled executable is attached.
-        pending.subtable = Some(ast::FunctionTable::new());
-        pending.precompiled_function = Some(precompiled);
+        *subtable = Some(ast::FunctionTable::new());
+        *precompiled_function = Some(precompiled);
     }
 }
 
@@ -395,7 +457,7 @@ fn precompile_declaration_functions(
     scope_id: ast::ScopeId,
     generator: &mut bytecode::generator::Generator,
     mode: FunctionPrecompileMode,
-) -> Vec<PendingSharedFunctionData> {
+) -> Vec<IncompleteSFDPtr> {
     if mode != FunctionPrecompileMode::All {
         return Vec::new();
     }
@@ -410,7 +472,7 @@ fn precompile_script_declaration_functions(
     scope_id: ast::ScopeId,
     generator: &mut bytecode::generator::Generator,
     mode: FunctionPrecompileMode,
-) -> Vec<PendingSharedFunctionData> {
+) -> Vec<IncompleteSFDPtr> {
     use ast::StatementKind;
 
     let arena = generator.arena.clone();
@@ -446,7 +508,7 @@ fn precompile_module_declaration_functions(
     scope_id: ast::ScopeId,
     generator: &mut bytecode::generator::Generator,
     mode: FunctionPrecompileMode,
-) -> Vec<PendingSharedFunctionData> {
+) -> Vec<IncompleteSFDPtr> {
     use ast::StatementKind;
 
     let arena = generator.arena.clone();
@@ -492,14 +554,21 @@ fn precompile_declaration_function(
     name_override: Option<ast::Utf16String>,
     generator: &mut bytecode::generator::Generator,
     mode: FunctionPrecompileMode,
-) -> PendingSharedFunctionData {
-    let function_data = generator.function_table.take(function_id);
+) -> IncompleteSFDPtr {
+    let function_data_ptr = generator.function_table.take(function_id);
+    let mut guard = function_data_ptr.lock().expect("function data mutex was poisoned");
+    if guard.has_finish_compile() {
+        return function_data_ptr.clone();
+    }
+    let function_data = std::mem::replace(&mut *guard, IncompleteSharedFunctionData::Materialized); // just as placeholder
+    let IncompleteSharedFunctionData::Ast { ast_fd } = function_data else {
+        unreachable!("pending declaration function data was expected to be in the Ast state");
+    };
+
     let arena = generator.arena.clone();
-    let subtable = generator
-        .function_table
-        .extract_reachable(&function_data, &arena.scopes);
+    let subtable = generator.function_table.extract_reachable(&ast_fd, &arena.scopes);
     let payload = ast::FunctionPayload {
-        data: *function_data,
+        data: *ast_fd,
         function_table: subtable,
         arena: arena.clone(),
     };
@@ -510,8 +579,7 @@ fn precompile_declaration_function(
         arena.clone(),
         mode,
     );
-
-    PendingSharedFunctionData {
+    let new_data = IncompleteSharedFunctionData::Bytecode {
         function_data: Some(function_data),
         subtable: Some(ast::FunctionTable::new()),
         arena: Some(arena),
@@ -519,7 +587,10 @@ fn precompile_declaration_function(
         class_field_initializer_name: None,
         should_eager_compile: false,
         precompiled_function: Some(precompiled_function),
-    }
+    };
+
+    *guard = new_data; // place the compiled function data back into the ptr
+    function_data_ptr.clone()
 }
 
 /// Shared compilation pipeline: local variable setup → codegen → assemble → create Executable.
@@ -1488,19 +1559,36 @@ pub unsafe extern "C" fn rust_compile_dynamic_function(
                 return std::ptr::null_mut();
             };
 
-            let mut function_data = parser.function_table.take(function_id);
+            let function_data_ptr = parser.function_table.take(function_id);
+            let mut function_data_guard = function_data_ptr
+                .lock()
+                .expect("FunctionData should not be locked at this point");
 
-            // Dynamic functions always need an arguments object, matching the C++
-            // path in FunctionConstructor::create_dynamic_function.
-            function_data.parsing_insights.might_need_arguments_object = true;
+            let mut is_strict = false;
+            if let IncompleteSharedFunctionData::Bytecode { function_data, .. } = &mut *function_data_guard
+                && let Some(fd) = function_data
+            {
+                fd.parsing_insights.might_need_arguments_object = true;
+                is_strict = fd.is_strict_mode;
+            }
 
-            let is_strict = function_data.is_strict_mode;
-            let subtable = parser
-                .function_table
-                .extract_reachable(&function_data, &parser.arena.scopes);
-            let arena = std::sync::Arc::new(std::mem::take(&mut parser.arena));
+            let incomplete_data =
+                std::mem::replace(&mut *function_data_guard, IncompleteSharedFunctionData::Materialized);
 
-            bytecode::ffi::create_sfd_for_gdi(function_data, subtable, vm_ptr, source_code_ptr, is_strict, arena)
+            let IncompleteSharedFunctionData::Bytecode {
+                function_data,
+                subtable,
+                arena,
+                ..
+            } = incomplete_data
+            else {
+                panic!("Unexpected state in IncompleteSharedFunctionData");
+            };
+            let fd = function_data.expect("Expected complete FunctionData");
+            let st = subtable.expect("Expected subtable");
+            let ar = arena.expect("Expected arena");
+
+            bytecode::ffi::create_sfd_for_gdi(fd, st, vm_ptr, source_code_ptr, is_strict, ar)
         })
     }
 }
@@ -1578,10 +1666,24 @@ pub unsafe extern "C" fn rust_compile_builtin_file(
             let scope = &arena.scopes[scope_id];
             for child in &scope.children {
                 if let StatementKind::FunctionDeclaration(ref fd) = child.inner {
-                    let function_data = parser.function_table.take(fd.function_id);
+                    let function_data_ptr = parser.function_table.take(fd.function_id);
+                    let mut function_data_guard = function_data_ptr
+                        .lock()
+                        .expect("FunctionData should not be locked at this point");
+                    let function_data =
+                        std::mem::replace(&mut *function_data_guard, IncompleteSharedFunctionData::Materialized);
+                    let IncompleteSharedFunctionData::Ast {
+                        ast_fd: function_data, ..
+                    } = function_data
+                    else {
+                        panic!(
+                            "Expected bytecode function data for top-level function in builtin file, finding {}",
+                            function_data.dump_type()
+                        );
+                    };
                     let subtable = parser.function_table.extract_reachable(&function_data, &arena.scopes);
                     let sfd_ptr = bytecode::ffi::create_sfd_for_gdi(
-                        function_data,
+                        function_data.clone(),
                         subtable,
                         vm_ptr,
                         source_code_ptr,
@@ -2137,10 +2239,21 @@ unsafe fn extract_module_declarations(
                             .name
                             .is_some_and(|n| arena.name_of(n).as_slice() == default_name.as_slice());
 
-                    let function_data = function_table.take(fd.function_id);
+                    let function_data_ptr = function_table.take(fd.function_id);
+                    let mut function_data_guard = function_data_ptr
+                        .lock()
+                        .expect("FunctionData should not be locked at this point");
+                    let function_data =
+                        std::mem::replace(&mut *function_data_guard, IncompleteSharedFunctionData::Materialized);
+                    let IncompleteSharedFunctionData::Bytecode { function_data, .. } = function_data else {
+                        panic!("Expected Bytecode FunctionData for module function");
+                    };
+                    let Some(function_data) = function_data else {
+                        panic!("Expected complete FunctionData for module function");
+                    };
                     let subtable = function_table.extract_reachable(&function_data, &arena.scopes);
                     let sfd_ptr = bytecode::ffi::create_sfd_for_gdi(
-                        function_data,
+                        function_data.clone(),
                         subtable,
                         vm_ptr,
                         source_code_ptr,
@@ -2438,11 +2551,22 @@ fn extract_gdi_common(
             && let Some(name_ident) = fd.name
             && last_position.get(&arena.identifiers[name_ident].name).copied() == Some(i)
         {
-            let function_data = function_table.take(fd.function_id);
+            let function_data_ptr = function_table.take(fd.function_id);
+            let mut function_data_guard = function_data_ptr
+                .lock()
+                .expect("FunctionData should not be locked at this point");
+            let function_data =
+                std::mem::replace(&mut *function_data_guard, IncompleteSharedFunctionData::Materialized);
+            let IncompleteSharedFunctionData::Ast {
+                ast_fd: function_data, ..
+            } = function_data
+            else {
+                panic!("Expected Ast FunctionData for function declaration");
+            };
             let subtable = function_table.extract_reachable(&function_data, &arena.scopes);
             let sfd_ptr = unsafe {
                 bytecode::ffi::create_sfd_for_gdi(
-                    function_data,
+                    function_data.clone(),
                     subtable,
                     vm_ptr,
                     source_code_ptr,
@@ -2704,7 +2828,6 @@ pub unsafe extern "C" fn rust_free_function_ast(ast: *mut c_void) {
         });
     }
 }
-
 /// Clone a lazy function compilation payload.
 ///
 /// The clone lets background compilation race with synchronous lazy

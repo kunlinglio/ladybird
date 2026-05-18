@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::fast_hash::HashMap;
+use crate::{IncompleteSFDPtr, IncompleteSharedFunctionData};
 
 use crate::u32_from_usize;
 
@@ -232,7 +233,7 @@ pub struct FunctionId(u32);
 /// moved out exactly once (during codegen / GDI). This eliminates the
 /// deep clone that was previously required in `create_shared_function_data`.
 pub struct FunctionTable {
-    functions: HashMap<FunctionId, Box<FunctionData>>,
+    functions: HashMap<FunctionId, IncompleteSFDPtr>,
     next_id: u32,
 }
 
@@ -260,10 +261,10 @@ impl FunctionTable {
     }
 
     /// Insert a `FunctionData`, returning a `FunctionId` handle.
-    pub fn insert(&mut self, data: FunctionData) -> FunctionId {
+    pub fn insert(&mut self, data: IncompleteSFDPtr) -> FunctionId {
         let id = FunctionId(self.next_id);
         self.next_id += 1;
-        self.functions.insert(id, Box::new(data));
+        self.functions.insert(id, data);
         id
     }
 
@@ -271,27 +272,30 @@ impl FunctionTable {
     ///
     /// # Panics
     /// Panics if the slot was already taken.
-    pub fn get(&self, id: FunctionId) -> &FunctionData {
-        self.functions.get(&id).expect("FunctionTable::get: slot already taken")
+    pub fn get(&self, id: FunctionId) -> IncompleteSFDPtr {
+        self.functions
+            .get(&id)
+            .expect("FunctionTable::get: slot already taken")
+            .clone()
     }
 
     /// Take ownership of the data (for codegen / GDI).
     ///
     /// # Panics
     /// Panics if the slot was already taken.
-    pub fn take(&mut self, id: FunctionId) -> Box<FunctionData> {
+    pub fn take(&mut self, id: FunctionId) -> IncompleteSFDPtr {
         self.functions
             .remove(&id)
             .expect("FunctionTable::take: slot already taken")
     }
 
     /// Take ownership if the slot is still present; returns None if already taken.
-    fn try_take(&mut self, id: FunctionId) -> Option<Box<FunctionData>> {
+    fn try_take(&mut self, id: FunctionId) -> Option<IncompleteSFDPtr> {
         self.functions.remove(&id)
     }
 
     /// Insert a `Box<FunctionData>` at a specific id.
-    fn insert_at(&mut self, id: FunctionId, data: Box<FunctionData>) {
+    fn insert_at(&mut self, id: FunctionId, data: IncompleteSFDPtr) {
         self.functions.insert(id, data);
     }
 
@@ -324,13 +328,27 @@ impl FunctionTable {
     }
 
     fn transfer(&mut self, id: FunctionId, result: &mut FunctionTable, scopes: &ScopeArena) {
-        if let Some(data) = self.try_take(id) {
-            if let Some(nested_function_ids) = &data.nested_function_ids {
+        if let Some(data_ptr) = self.try_take(id) {
+            let data = data_ptr
+                .lock()
+                .expect("FunctionTable::transfer: data already taken by another thread");
+
+            let function_data = match &*data {
+                IncompleteSharedFunctionData::Ast { ast_fd } => ast_fd,
+                IncompleteSharedFunctionData::Bytecode { function_data, .. } => function_data
+                    .as_ref()
+                    .expect("FunctionTable::transfer: expected complete function data"),
+                _ => panic!(
+                    "FunctionTable::transfer: expected AST or Bytecode function data, got {:?}",
+                    data.dump_type()
+                ),
+            };
+            if let Some(nested_function_ids) = &function_data.nested_function_ids {
                 for id in nested_function_ids {
                     self.transfer(*id, result, scopes);
                 }
             } else {
-                for param in &data.parameters {
+                for param in &function_data.parameters {
                     if let Some(ref default) = param.default_value {
                         self.collect_from_expression(default, result, scopes);
                     }
@@ -338,9 +356,9 @@ impl FunctionTable {
                         self.collect_from_pattern(pat, result, scopes);
                     }
                 }
-                self.collect_from_statement(&data.body, result, scopes);
+                self.collect_from_statement(&function_data.body, result, scopes);
             }
-            result.insert_at(id, data);
+            result.insert_at(id, data_ptr.clone()); //FIXME: can we avoid take it out and put it back in transfer()?
         }
     }
 
