@@ -5337,7 +5337,16 @@ fn emit_switch_block_declaration_instantiation(generator: &mut Generator, data: 
 
 fn is_anonymous_function_definition(generator: &Generator, expression: &Expression) -> bool {
     match &expression.inner {
-        ExpressionKind::Function(function_id) => generator.function_table.get(*function_id).name.is_none(),
+        ExpressionKind::Function(function_id) => {
+            let function_data_ptr = generator.function_table.get(*function_id);
+            let function_data_guard = function_data_ptr
+                .lock()
+                .expect("Incomplete Shared function data ptr corrupted");
+            let IncompleteSharedFunctionData::Ast { ast_fd } = &*function_data_guard else {
+                panic!("Expected AST function data for function expression");
+            };
+            ast_fd.name.is_none()
+        }
         ExpressionKind::Class(data) => data.name.is_none(),
         _ => false,
     }

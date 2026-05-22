@@ -153,13 +153,13 @@ public:
         : 1 { ConstructorKind::Base };         // [[ConstructorKind]]
     bool m_is_class_constructor : 1 { false }; // [[IsClassConstructor]]
 
-    // // Note: Pointer to Rust Arc<Mutex<PendingFunctionData>>,
+    // // Note: Pointer to Rust Arc<Mutex<IncompleteSharedFunctionData>>,
     // //       used for unified function lazy parsing, compilation and
     // //       materialization.
-    // // If match!(m_pending_payload, PendingFunctionData::Materialized),
+    // // If match!(m_incomplete_payload, IncompleteSharedFunctionData::Materialized),
     // // then m_executable != nullptr, so there is no need to apply FFI calls on
     // // each JS function call.
-    // void* m_pending_payload { nullptr };
+    // void* m_incomplete_payload { nullptr };
 
     // NB: When non-null, points to a Rust Box<FunctionData> used for
     //     lazy compilation through the Rust pipeline.

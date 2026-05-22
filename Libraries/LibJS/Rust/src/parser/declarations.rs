@@ -686,9 +686,17 @@ impl Parser<'_> {
             // ClassHeritage[Yield, Await] : `extends` LeftHandSideExpression[?Yield, ?Await]
             if expression.range.start.offset == heritage_start.offset
                 && let ExpressionKind::Function(function_id) = &expression.inner
-                && self.function_table.get(*function_id).is_arrow_function
             {
-                self.syntax_error("Arrow function is not allowed in class heritage");
+                let function_data_ptr = self.function_table.get(*function_id);
+                let function_data_guard = function_data_ptr
+                    .lock()
+                    .expect("Incomplete Shared function data ptr corrupted");
+                let IncompleteSharedFunctionData::Ast { ast_fd } = &*function_data_guard else {
+                    panic!("Expected AST function data for function expression");
+                };
+                if ast_fd.is_arrow_function {
+                    self.syntax_error("Arrow function is not allowed in class heritage");
+                }
             }
             Some(Box::new(expression))
         } else {
